@@ -203,12 +203,6 @@ Implementation corrections are explicit:
 - Nonconverged nonlinear fits are excluded from candidate selection; failed intervals are distinguished from finite or capped intervals.
 - Random plot jitter has a fixed seed. Numeric p-value labels replace some source star annotations without changing the tests.
 
-## Validation status
-
-All 22 R chunks passed syntax checks in R 4.3.0 through WebAssembly. In-memory synthetic tests passed for viability normalization, value-preserving combination with reordered timepoints, the time cutoff, invalid-input guards, concentration–response model anchors, and the rank-scaling/Bliss identities. These tests exercise the numeric helpers independently of Excel input/output.
-
-A complete package-dependent render and full end-to-end workflow execution were not verified in the preparation environment: its WebAssembly package repository lacked dependencies required by MESS/ggpubr. The study's experimental input workbooks were not supplied for this consolidation, so manuscript values were not reproduced or compared. Run the configured notebook with the full R package set and study data before relying on regenerated numerical results or publication figures.
-
 ## Citation and license
 
 Cite the associated MortaLIVE manuscript when using this analysis. Add its final bibliographic details or DOI to this section when available. No software license has been inferred or assigned; repository maintainers should choose and include a license before distributing the code for reuse.
