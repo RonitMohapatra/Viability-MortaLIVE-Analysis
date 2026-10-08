@@ -1,0 +1,1883 @@
+---
+title: "MortaLIVE analysis workflow"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+params:
+  run_viability: false
+  run_bliss: false
+  run_outgrowth: false
+  run_ic50: false
+  run_validation: false
+  run_comparison: false
+  run_sholl_assembly: false
+---
+
+# Overview
+
+This document combines the MortaLIVE paper's analysis workflows into one executable
+notebook. The sections cover viability normalization, Bliss independence, exposure-related
+outgrowth, IC50 estimation, assay compatibility validation, and method comparisons.
+An optional Fiji CSV assembly utility supports profile preparation.
+
+| Manuscript panel | Analysis section |
+| --- | --- |
+| Fig. 1d–e | Compatibility validation: normalized β-III-tubulin and GFAP AUC |
+| Fig. S6 | Bliss independence: single agents versus mixture |
+| Fig. 3c | Method comparison: mean intersection traces |
+| Fig. 3d | Method comparison: raw AUC versus MortaLIVE |
+| Fig. S7; Fig. 4b–c | Exposure-related Sholl AUC analysis; configure GFAP, NO, or ML inputs |
+| Fig. 4d | Outgrowth concentration–response fitting and IC50 intervals |
+| Upstream viability processing | Within-experiment VC normalization and workbook combination |
+
+Configure input files in **Configuration**, then enable the corresponding parameters
+in the YAML header or in `rmarkdown::render()`. All analyses are disabled initially,
+so the document can render its methods and code without experimental input files.
+The sections use independent inputs; enabling one does not automatically enable the
+others. Outgrowth IC50 inputs may be generated in the same run by the outgrowth section.
+
+The workflow preserves the analytical choices in the source scripts, with input
+validation and implementation corrections documented in `README.md`. It does not
+perform image segmentation, plate assignment, longitudinal ANOVA, or cross-assay
+paired comparisons. Raw images and experimental data are not embedded in this file.
+
+```{r setup}
+# Also permits sequential interactive execution outside rmarkdown::render().
+if (!exists("params")) {
+  params <- list(run_viability = FALSE, run_bliss = FALSE,
+                 run_outgrowth = FALSE, run_ic50 = FALSE, run_validation = FALSE,
+                 run_comparison = FALSE, run_sholl_assembly = FALSE)
+}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                     error = FALSE, fig.width = 12, fig.height = 5)
+options(stringsAsFactors = FALSE)
+required <- c("knitr", "rmarkdown")
+if (params$run_viability) required <- c(required, "openxlsx")
+if (params$run_bliss) required <- c(required, "readxl", "dplyr", "tidyr",
+                                  "tibble", "janitor", "writexl")
+if (params$run_outgrowth || params$run_validation || params$run_comparison) required <- c(required, "readxl", "readr", "dplyr",
+    "tidyr", "tibble", "purrr", "stringr", "MESS", "ggplot2", "ggpubr", "writexl")
+if (params$run_ic50) required <- c(required, "readr", "dplyr", "tidyr",
+                                 "tibble", "purrr", "minpack.lm", "writexl", "MASS")
+if (params$run_sholl_assembly) required <- c(required, "dplyr", "stringr", "writexl")
+required <- unique(required)
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Install required packages before running: ",
+                          paste(missing, collapse = ", "))
+# Only packages needed by enabled sections are attached. Installation is separate.
+invisible(lapply(setdiff(required, c("MASS", "knitr", "rmarkdown")),
+                 library, character.only = TRUE))
+```
+
+# Configuration
+
+Paths are relative to the directory containing this R Markdown file. Each run ID
+identifies a source experiment, not a biological replicate or a statistical block.
+Do not list the same experiment twice under different IDs.
+
+```{r configuration}
+output_root <- "analysis_output"
+overwrite_outputs <- FALSE
+QC_TOLERANCE <- 1e-8
+
+# 1. Viability: add any number of independent source workbooks.
+viability_files <- c(run01 = "data/viability_run01.xlsx",
+                     run02 = "data/viability_run02.xlsx",
+                     run03 = "data/viability_run03.xlsx")
+analysis_sheet_pattern <- "^(Cd|Cr|Cd\\+Cr|Pb) Norm (LD|LIVE|DEAD)$"
+treatment_order <- c("VC", "0.32 µM", "3.2 µM", "10 µM", "50 µM", "Death Control")
+# NULL retains every timepoint. Set 72 to exclude later observations explicitly.
+viability_max_time_h <- NULL
+
+# 2. Bliss: one row per matched component concentration, with replicate columns.
+bliss_input_file <- "data/mixture_72h.xlsx"
+bliss_input_sheet <- "RME quantification"
+bliss_bootstrap_iterations <- 5000L
+bliss_seed <- 831L
+
+# 3. Outgrowth: one row per assay and independently normalized experiment.
+# All profiles in a selected sheet must belong to the same source experiment.
+outgrowth_inputs <- data.frame(
+  Assay = rep(c("ML", "NO"), each = 3),
+  Run_ID = rep(c("run01", "run02", "run03"), times = 2),
+  File = paste0("data/", rep(c("ML", "NO"), each = 3), "_",
+                rep(c("run01", "run02", "run03"), times = 2), ".xlsx"),
+  Sheet = "Sheet1"
+)
+outgrowth_radius_unit <- "um"
+outgrowth_radius_step <- NULL  # No subsampling for already-formatted profiles.
+outgrowth_exact <- FALSE       # Use NULL for the earlier acute-metal script's automatic exact-test choice.
+outgrowth_doses_uM <- c(0, 0.32, 3.2, 10)
+outgrowth_metals <- c("Cd", "Cr", "Mix", "Pb")
+single_run_min_n <- 1L
+pooled_min_n <- 2L
+wilcoxon_adjustment <- "BH"
+single_run_display_cutoff <- 0.075
+pooled_display_cutoff <- 0.05
+plot_error <- "SEM"  # Source scripts use SEM; SD is an explicit alternative.
+plot_seed <- 831L
+
+# 4. Compatibility validation (Fig. 1d–e): separate marker datasets.
+validation_inputs <- data.frame(
+  Marker = c("btubIII", "GFAP"), Source_ID = c("btubIII_validation", "GFAP_validation"),
+  File = c("data/validation_btubIII.xlsx", "data/validation_GFAP.xlsx"), Sheet = "Sheet1"
+)
+validation_groups <- c("Ctrl", "0.0005ML", "0.001ML")
+validation_radius_step <- 10  # Retain multiples of 10 input pixels, as in scripts 06–07.
+validation_radius_unit <- "px"
+validation_radius_scale <- 1 # For conversion, supply calibration and change the output unit label.
+
+# 5. Method comparison (Fig. 3c–d): add a measured combined-marker row if available.
+comparison_inputs <- data.frame(
+  Method = c("IF_bTubIII", "IF_GFAP", "ML"),
+  Source_ID = c("IF_bTubIII", "IF_GFAP", "ML"),
+  File = c("data/comparison_IF.xlsx", "data/comparison_IF_GFAP.xlsx", "data/comparison_ML.xlsx"),
+  Sheet = "Sheet1"
+)
+# Optional row: Method = "IF_bTubIII_GFAP", with its own measured profile workbook.
+comparison_reference <- "ML"
+comparison_radius_step <- 10
+comparison_radius_unit <- "px"
+comparison_radius_scale <- 1 # Filtering occurs in input units before this conversion.
+comparison_ribbon <- "SEM" # Source default; CI95_half_width is an explicit alternative.
+
+# 6. Optional CSV preprocessing; independent of the figure analyses.
+sholl_parent_dir <- "data/sholl_profiles"
+
+# 7. IC50: pooled outgrowth CSVs, either existing or generated in section 3.
+ic50_files <- c(
+  ML = file.path(output_root, "outgrowth", "ML_combined_normalized_AUC_per_replicate.csv"),
+  NO = file.path(output_root, "outgrowth", "NO_combined_normalized_AUC_per_replicate.csv")
+)
+ic50_metals <- c("Cd", "Cr", "Mix", "Pb")
+max_iterations <- 1000L
+max_IC50 <- 1000
+max_logIC50 <- log10(max_IC50)
+```
+
+## Shared validation
+
+Blank measurements remain missing. Non-numeric entries, duplicated identifiers,
+invalid denominators, and incompatible input layouts stop execution with a message.
+
+```{r validation-functions}
+check_file <- function(path, sheet = NULL) {
+  if (!file.exists(path)) stop("Input file not found: ", path)
+  if (!is.null(sheet) && !sheet %in% readxl::excel_sheets(path))
+    stop("Worksheet '", sheet, "' not found in ", path)
+  invisible(path)
+}
+strict_numeric <- function(x, context) {
+  text <- trimws(as.character(x))
+  blank <- is.na(x) | text == ""
+  value <- suppressWarnings(as.numeric(text))
+  if (any(!blank & !is.finite(value)))
+    stop("Non-numeric or non-finite value in ", context, ": ",
+         paste(unique(text[!blank & !is.finite(value)]), collapse = ", "))
+  value[blank] <- NA_real_
+  value
+}
+output_path <- function(section, filename) {
+  directory <- file.path(output_root, section)
+  dir.create(directory, recursive = TRUE, showWarnings = FALSE)
+  path <- file.path(directory, filename)
+  if (file.exists(path) && !overwrite_outputs)
+    stop("Output exists: ", path, ". Choose a new output_root or enable overwrite_outputs.")
+  path
+}
+check_ids <- function(ids, context) {
+  if (!length(ids) || anyNA(ids) || any(!grepl("^[A-Za-z0-9_-]+$", ids)) ||
+      anyDuplicated(ids)) stop(context, " must contain unique, nonempty IDs using letters, digits, _ or -.")
+}
+```
+
+# Viability normalization and combination
+
+## Input and calculation
+
+Each workbook contains two-header-row sheets named, for example, `Cd Norm LD`,
+`Cr Norm LIVE`, or `Cd+Cr Norm DEAD`. Row 1 identifies treatment blocks, row 2
+contains well IDs, and column A contains time in hours. The treatment label appears
+only at the start of its block. Blank replicate slots must retain their columns.
+
+For each source experiment, endpoint, and timepoint:
+
+\[
+Y_{\%VC}=100\,Y/\overline{Y}_{VC}.
+\]
+
+These inputs are already image-derived measurements; the code does not calculate
+organoid area or perform live/dead segmentation. Individual VC values vary around
+100%; only their mean is fixed. Combination preserves replicate-level values and
+matches rows by time. It does not average experiments or repeat normalization.
+
+```{r viability-normalization-functions}
+read_mortalive_sheet <- function(file, sheet) {
+  raw <- openxlsx::read.xlsx(
+    xlsxFile = file,
+    sheet = sheet,
+    colNames = FALSE,
+    skipEmptyRows = FALSE,
+    skipEmptyCols = FALSE,
+    check.names = FALSE
+  )
+  if (nrow(raw) < 3) {
+    stop(sprintf("Sheet '%s' does not contain two header rows plus data.", sheet))
+  }
+  raw
+}
+# Detect the contiguous VC block from header row 1.
+find_vc_columns <- function(header_row, sheet) {
+  header_row <- trimws(as.character(header_row))
+  vc_start <- which(!is.na(header_row) & header_row == "VC")
+  if (length(vc_start) != 1) {
+    stop(sprintf(
+      "Expected exactly one 'VC' header in sheet '%s'; found %d.",
+      sheet,
+      length(vc_start)
+    ))
+  }
+  nonblank_headers <- which(
+    !is.na(header_row) & nchar(trimws(header_row)) > 0
+  )
+  next_group_start <- nonblank_headers[nonblank_headers > vc_start][1]
+  if (is.na(next_group_start)) {
+    stop(sprintf(
+      "Could not identify the treatment block following VC in sheet '%s'.",
+      sheet
+    ))
+  }
+  vc_start:(next_group_start - 1)
+}
+# Normalize one analysis sheet to its timepoint-matched VC mean.
+normalize_sheet_to_vc <- function(file, sheet, tolerance = QC_TOLERANCE) {
+  raw <- read_mortalive_sheet(file, sheet)
+  # First row = treatment headers; second row = well IDs.
+  header1 <- unlist(raw[1, , drop = TRUE], use.names = FALSE)
+  # Rows 3 onward contain time and numeric measurements.
+  dat <- raw[-c(1, 2), , drop = FALSE]
+  # Convert the data block to numeric.
+  # Blank spacer cells remain NA.
+  dat[] <- lapply(dat, function(x) {
+    strict_numeric(x, paste(basename(file), sheet))
+  })
+  # Keep only actual timepoint rows.
+  missing_time <- is.na(dat[[1]])
+  if (any(missing_time & rowSums(!is.na(dat[-1])) > 0))
+    stop("Measurements without a numeric timepoint in ", sheet)
+  dat <- dat[!missing_time, , drop = FALSE]
+  if (anyDuplicated(dat[[1]])) stop("Duplicate timepoints in ", sheet)
+  if (nrow(dat) == 0) {
+    stop(sprintf("No numeric timepoints found in sheet '%s'.", sheet))
+  }
+  vc_cols <- find_vc_columns(header1, sheet)
+  # Mean VC at each timepoint. Missing VC wells are ignored, NOT treated as zero.
+  vc_matrix <- as.matrix(dat[, vc_cols, drop = FALSE])
+  vc_n <- rowSums(!is.na(vc_matrix))
+  vc_mean <- rowMeans(vc_matrix, na.rm = TRUE)
+  # Guard against invalid normalization denominators.
+  bad_vc <- !is.finite(vc_mean) | vc_mean <= 0 | vc_n == 0
+  if (any(bad_vc)) {
+    bad_times <- paste(dat[[1]][bad_vc], collapse = ", ")
+    stop(sprintf(
+      "Invalid VC mean in sheet '%s' at timepoint(s): %s",
+      sheet,
+      bad_times
+    ))
+  }
+  normalized <- dat
+  # Column 1 is TIME and must not be normalized.
+  measurement_cols <- 2:ncol(normalized)
+  normalized_matrix <- as.matrix(
+    normalized[, measurement_cols, drop = FALSE]
+  )
+  normalized[, measurement_cols] <- sweep(
+    normalized_matrix,
+    MARGIN = 1,
+    STATS = vc_mean,
+    FUN = "/"
+  ) * 100
+  # QC: the mean of the available normalized VC wells must be 100 at every timepoint.
+  normalized_vc_mean <- rowMeans(
+    as.matrix(normalized[, vc_cols, drop = FALSE]),
+    na.rm = TRUE
+  )
+  max_abs_error <- max(abs(normalized_vc_mean - 100), na.rm = TRUE)
+  if (max_abs_error > tolerance) {
+    stop(sprintf(
+      "VC normalization QC failed for sheet '%s'. Max absolute error = %.12g",
+      sheet,
+      max_abs_error
+    ))
+  }
+  list(
+    data = normalized,
+    vc_cols = vc_cols,
+    vc_mean_raw = vc_mean,
+    vc_n = vc_n,
+    normalized_vc_mean = normalized_vc_mean,
+    max_abs_error = max_abs_error
+  )
+}
+# Normalize every MortaLIVE analysis sheet in one workbook.
+# The original workbook is loaded and only the numeric data rows are replaced,
+# so the existing worksheet structure, headers, and Well Map are retained.
+normalize_workbook_to_vc <- function(input_file, output_file) {
+  if (!file.exists(input_file)) {
+    stop(sprintf("Input file not found: %s", input_file))
+  }
+  all_sheets <- openxlsx::getSheetNames(input_file)
+  analysis_sheets <- grep(
+    analysis_sheet_pattern,
+    all_sheets,
+    value = TRUE
+  )
+  if (length(analysis_sheets) == 0) {
+    stop(sprintf("No MortaLIVE analysis sheets found in: %s", input_file))
+  }
+  wb <- openxlsx::loadWorkbook(input_file)
+  qc_rows <- vector("list", length(analysis_sheets))
+  for (i in seq_along(analysis_sheets)) {
+    sheet <- analysis_sheets[i]
+    result <- normalize_sheet_to_vc(input_file, sheet)
+    # Write normalized numeric values back beginning at Excel row 3.
+    # Rows 1-2 and workbook formatting are left in place.
+    source_raw <- read_mortalive_sheet(input_file, sheet)
+    openxlsx::deleteData(wb, sheet, cols = seq_len(ncol(source_raw)),
+                         rows = seq.int(3, nrow(source_raw)), gridExpand = TRUE)
+    openxlsx::writeData(
+      wb = wb,
+      sheet = sheet,
+      x = result$data,
+      startCol = 1,
+      startRow = 3,
+      colNames = FALSE,
+      rowNames = FALSE,
+      keepNA = FALSE
+    )
+    qc_rows[[i]] <- data.frame(
+      sheet = sheet,
+      timepoints = nrow(result$data),
+      vc_n_min = min(result$vc_n),
+      vc_n_max = max(result$vc_n),
+      max_abs_error_from_100 = result$max_abs_error,
+      stringsAsFactors = FALSE
+    )
+  }
+  openxlsx::saveWorkbook(
+    wb,
+    file = output_file,
+    overwrite = TRUE
+  )
+  do.call(rbind, qc_rows)
+}
+```
+
+```{r viability-combination-readers}
+# Clean header cells
+clean_header <- function(x) {
+  x <- as.character(x)
+  x[is.na(x)] <- ""
+  trimws(x)
+}
+# Identify the six treatment blocks
+find_treatment_blocks <- function(
+  raw,
+  sheet
+) {
+  header1 <- clean_header(
+    unlist(
+      raw[1, , drop = TRUE],
+      use.names = FALSE
+    )
+  )
+  if (any(vapply(treatment_order, function(x) sum(header1 == x), integer(1)) != 1L))
+    stop("Each configured treatment must occur exactly once in row 1 of ", sheet)
+  starts <- match(
+    treatment_order,
+    header1
+  )
+  if (anyNA(starts)) {
+    missing_treatments <- treatment_order[
+      is.na(starts)
+    ]
+    stop(
+      sprintf(
+        "Sheet '%s' is missing treatment header(s): %s",
+        sheet,
+        paste(
+          missing_treatments,
+          collapse = ", "
+        )
+      )
+    )
+  }
+  # Confirm treatments occur in the expected order
+  if (any(diff(starts) <= 0)) {
+    stop(
+      sprintf(
+        "Treatment blocks are not in the expected order in sheet '%s'.",
+        sheet
+      )
+    )
+  }
+  # Each treatment extends until the column before
+  # the next treatment header.
+  ends <- c(
+    starts[-1] - 1,
+    ncol(raw)
+  )
+  blocks <- Map(
+    seq.int,
+    starts,
+    ends
+  )
+  names(blocks) <- treatment_order
+  widths <- lengths(blocks)
+  # All treatment blocks in one source workbook
+  # should have equal capacity.
+  if (length(unique(widths)) != 1) {
+    stop(
+      sprintf(
+        "Treatment blocks have unequal widths in sheet '%s': %s",
+        sheet,
+        paste(
+          widths,
+          collapse = ", "
+        )
+      )
+    )
+  }
+  list(
+    blocks = blocks,
+    block_width = widths[1]
+  )
+}
+# Read one normalized analysis sheet from one batch
+read_normalized_batch_sheet <- function(
+  file,
+  sheet,
+  batch_tag
+) {
+  raw <- read_mortalive_sheet(
+    file = file,
+    sheet = sheet
+  )
+  block_info <- find_treatment_blocks(
+    raw = raw,
+    sheet = sheet
+  )
+  # Row 2 contains well IDs
+  header2 <- clean_header(
+    unlist(
+      raw[2, , drop = TRUE],
+      use.names = FALSE
+    )
+  )
+  # Rows 3 onward contain time and numerical data
+  dat <- raw[
+    -c(1, 2),
+    ,
+    drop = FALSE
+  ]
+  dat[] <- lapply(dat, strict_numeric, context = paste(basename(file), sheet))
+  if (any(is.na(dat[[1]]) & rowSums(!is.na(dat[-1])) > 0))
+    stop("Measurements without a timepoint in ", sheet)
+  # Remove any rows without a numeric timepoint
+  dat <- dat[
+    !is.na(dat[[1]]),
+    ,
+    drop = FALSE
+  ]
+  if (!is.null(viability_max_time_h))
+    dat <- dat[dat[[1]] <= viability_max_time_h, , drop = FALSE]
+  times <- as.numeric(
+    dat[[1]]
+  )
+  if (length(times) == 0) {
+    stop(
+      sprintf(
+        "No numeric timepoints found in sheet '%s' of '%s'.",
+        sheet,
+        basename(file)
+      )
+    )
+  }
+  if (anyDuplicated(times)) {
+    stop(
+      sprintf(
+        "Duplicate timepoints found in sheet '%s' of '%s'.",
+        sheet,
+        basename(file)
+      )
+    )
+  }
+  well_ids <- vector(
+    "list",
+    length(treatment_order)
+  )
+  values <- vector(
+    "list",
+    length(treatment_order)
+  )
+  names(well_ids) <- treatment_order
+  names(values) <- treatment_order
+  for (treatment in treatment_order) {
+    cols <- block_info$blocks[[treatment]]
+    wells <- header2[cols]
+    populated <- colSums(!is.na(dat[, cols, drop = FALSE])) > 0
+    if (any(populated & wells == "")) stop("Measurements have no well ID in ", sheet)
+    if (anyDuplicated(wells[wells != ""])) stop("Duplicate well ID within a treatment in ", sheet)
+    # Prefix actual well IDs with the batch number.
+    #
+    # Example:
+    # A2 -> b1_A2
+    #
+    # Existing blank replicate slots remain blank.
+    wells <- ifelse(
+      wells == "",
+      "",
+      paste0(
+        batch_tag,
+        "_",
+        wells
+      )
+    )
+    well_ids[[treatment]] <- wells
+    values[[treatment]] <- as.matrix(
+      dat[
+        ,
+        cols,
+        drop = FALSE
+      ]
+    )
+  }
+  list(
+    time = times,
+    well_ids = well_ids,
+    values = values,
+    block_width = block_info$block_width
+  )
+}
+```
+
+```{r viability-combination-function}
+combine_one_analysis_sheet <- function(
+  files,
+  batch_tags,
+  sheet
+) {
+  # Read the same sheet from every batch
+  batch_data <- Map(
+    function(file, tag) {
+      read_normalized_batch_sheet(
+        file = file,
+        sheet = sheet,
+        batch_tag = tag
+      )
+    },
+    files,
+    batch_tags
+  )
+  # the first experiment establishes the reference time order
+  reference_times <- batch_data[[1]]$time
+  # Match every batch to the first experiment by actual time value
+  for (i in seq_along(batch_data)) {
+    current_times <- batch_data[[i]]$time
+    missing_times <- setdiff(
+      reference_times,
+      current_times
+    )
+    extra_times <- setdiff(
+      current_times,
+      reference_times
+    )
+    if (
+      length(missing_times) > 0 ||
+      length(extra_times) > 0
+    ) {
+      stop(
+        sprintf(
+          paste0(
+            "Timepoint mismatch in sheet '%s' for %s. ",
+            "Missing: [%s]; Extra: [%s]"
+          ),
+          sheet,
+          batch_tags[i],
+          paste(
+            missing_times,
+            collapse = ", "
+          ),
+          paste(
+            extra_times,
+            collapse = ", "
+          )
+        )
+      )
+    }
+    time_match <- match(
+      reference_times,
+      current_times
+    )
+    if (anyNA(time_match)) {
+      stop(
+        sprintf(
+          "Could not time-match %s in sheet '%s'.",
+          batch_tags[i],
+          sheet
+        )
+      )
+    }
+    # Reorder numerical data to the reference time order
+    for (treatment in treatment_order) {
+      batch_data[[i]]$values[[treatment]] <-
+        batch_data[[i]]$values[[treatment]][
+          time_match,
+          ,
+          drop = FALSE
+        ]
+    }
+  }
+  # Determine how many replicate slots each batch contributes
+  source_widths <- vapply(
+    batch_data,
+    function(x) {
+      x$block_width
+    },
+    numeric(1)
+  )
+  # Sum replicate capacities across all source experiments.
+  combined_block_width <- sum(
+    source_widths
+  )
+  # Begin combined table with TIME
+  header1 <- "TIME (h)"
+  header2 <- ""
+  combined_values <- matrix(
+    reference_times,
+    ncol = 1
+  )
+  # Combine one treatment at a time
+  for (treatment in treatment_order) {
+    # Row 1:
+    # treatment name followed by blank subheaders
+    treatment_header <- c(
+      treatment,
+      rep(
+        "",
+        combined_block_width - 1
+      )
+    )
+    # Row 2:
+    # b1 wells followed by b2 wells, etc.
+    treatment_wells <- unlist(
+      lapply(
+        batch_data,
+        function(x) {
+          x$well_ids[[treatment]]
+        }
+      ),
+      use.names = FALSE
+    )
+    # Numerical values:
+    # the first experiment columns followed by the next experiment columns
+    treatment_values <- do.call(
+      cbind,
+      lapply(
+        batch_data,
+        function(x) {
+          x$values[[treatment]]
+        }
+      )
+    )
+    # Width QC
+    if (
+      length(treatment_wells) !=
+      combined_block_width
+    ) {
+      stop(
+        sprintf(
+          "Well-header width error for '%s' in sheet '%s'.",
+          treatment,
+          sheet
+        )
+      )
+    }
+    if (
+      ncol(treatment_values) !=
+      combined_block_width
+    ) {
+      stop(
+        sprintf(
+          "Data width error for '%s' in sheet '%s'.",
+          treatment,
+          sheet
+        )
+      )
+    }
+    header1 <- c(
+      header1,
+      treatment_header
+    )
+    header2 <- c(
+      header2,
+      treatment_wells
+    )
+    combined_values <- cbind(
+      combined_values,
+      treatment_values
+    )
+  }
+  # Final expected number of columns
+  expected_columns <-
+    1 +
+    length(treatment_order) *
+    combined_block_width
+  if (
+    ncol(combined_values) !=
+    expected_columns
+  ) {
+    stop(
+      sprintf(
+        paste0(
+          "Combined column-count QC failed for sheet '%s'. ",
+          "Expected %d columns, found %d."
+        ),
+        sheet,
+        expected_columns,
+        ncol(combined_values)
+      )
+    )
+  }
+  list(
+    header1 = header1,
+    header2 = header2,
+    data = combined_values,
+    block_width = combined_block_width,
+    source_widths = source_widths,
+    timepoints = reference_times,
+    batch_data = batch_data
+  )
+}
+```
+
+```{r viability-copy-qc}
+verify_combined_sheet <- function(
+  result,
+  sheet,
+  batch_tags
+) {
+  combined_width <- result$block_width
+  source_widths <- result$source_widths
+  for (t in seq_along(treatment_order)) {
+    treatment <- treatment_order[t]
+    # First combined column belonging to this treatment.
+    #
+    # Column 1 is TIME, so the first treatment begins at 2.
+    treatment_start <-
+      2 +
+      (t - 1) *
+      combined_width
+    batch_offset <- 0
+    for (b in seq_along(result$batch_data)) {
+      width_b <- source_widths[b]
+      output_cols <-
+        treatment_start +
+        batch_offset +
+        seq_len(width_b) -
+        1
+      source_values <-
+        result$batch_data[[b]]$values[[treatment]]
+      output_values <-
+        result$data[
+          ,
+          output_cols,
+          drop = FALSE
+        ]
+      same_values <- isTRUE(
+        all.equal(
+          source_values,
+          output_values,
+          check.attributes = FALSE,
+          tolerance = 0
+        )
+      )
+      if (!same_values) {
+        stop(
+          sprintf(
+            "Copy QC failed for %s, '%s', sheet '%s'.",
+            batch_tags[b],
+            treatment,
+            sheet
+          )
+        )
+      }
+      batch_offset <-
+        batch_offset +
+        width_b
+    }
+  }
+  TRUE
+}
+```
+
+```{r viability-workbook-writer}
+combine_normalized_workbooks <- function(
+  files,
+  batch_tags,
+  output_file
+) {
+  # Use first batch to establish sheet order
+  reference_sheets <- openxlsx::getSheetNames(
+    files[1]
+  )
+  analysis_sheets <- grep(
+    analysis_sheet_pattern,
+    reference_sheets,
+    value = TRUE
+  )
+  if (length(analysis_sheets) == 0) {
+    stop(
+      "No MortaLIVE analysis sheets found."
+    )
+  }
+  # Confirm all batches contain the same analysis sheets
+  for (i in seq_along(files)) {
+    current_sheets <- grep(
+      analysis_sheet_pattern,
+      openxlsx::getSheetNames(
+        files[i]
+      ),
+      value = TRUE
+    )
+    if (
+      !setequal(
+        analysis_sheets,
+        current_sheets
+      )
+    ) {
+      stop(
+        sprintf(
+          "Analysis-sheet mismatch in %s.",
+          basename(files[i])
+        )
+      )
+    }
+  }
+  # Create a new clean workbook
+  wb <- openxlsx::createWorkbook()
+  # Preserve each source map separately when present.
+  for (j in seq_along(files)) {
+    if ("Well Map" %in% openxlsx::getSheetNames(files[j])) {
+      map_sheet <- paste0("Well Map ", j)
+      map <- openxlsx::read.xlsx(files[j], "Well Map", colNames = FALSE,
+                                  skipEmptyRows = FALSE, skipEmptyCols = FALSE)
+      openxlsx::addWorksheet(wb, map_sheet)
+      openxlsx::writeData(wb, map_sheet, map, colNames = FALSE)
+    }
+  }
+  manifest <- data.frame(Run_ID = batch_tags, Source_File = basename(files))
+  openxlsx::addWorksheet(wb, "Sources")
+  openxlsx::writeData(wb, "Sources", manifest)
+  # Header formatting
+  treatment_style <- openxlsx::createStyle(
+    textDecoration = "bold",
+    halign = "center",
+    valign = "center"
+  )
+  well_style <- openxlsx::createStyle(
+    halign = "center",
+    valign = "center"
+  )
+  qc_rows <- vector(
+    "list",
+    length(analysis_sheets)
+  )
+  # Process every matching analysis sheet
+  for (i in seq_along(analysis_sheets)) {
+    sheet <- analysis_sheets[i]
+    result <- combine_one_analysis_sheet(
+      files = files,
+      batch_tags = batch_tags,
+      sheet = sheet
+    )
+    # Confirm values were copied unchanged
+    verify_combined_sheet(
+      result = result,
+      sheet = sheet,
+      batch_tags = batch_tags
+    )
+    openxlsx::addWorksheet(
+      wb,
+      sheet
+    )
+    # Row 1 = treatment headers
+    openxlsx::writeData(
+      wb,
+      sheet,
+      t(result$header1),
+      startCol = 1,
+      startRow = 1,
+      colNames = FALSE,
+      rowNames = FALSE,
+      keepNA = FALSE
+    )
+    # Row 2 = batch-prefixed well IDs
+    openxlsx::writeData(
+      wb,
+      sheet,
+      t(result$header2),
+      startCol = 1,
+      startRow = 2,
+      colNames = FALSE,
+      rowNames = FALSE,
+      keepNA = FALSE
+    )
+    # Row 3 onward = TIME + normalized values
+    openxlsx::writeData(
+      wb,
+      sheet,
+      result$data,
+      startCol = 1,
+      startRow = 3,
+      colNames = FALSE,
+      rowNames = FALSE,
+      keepNA = FALSE
+    )
+    total_cols <- ncol(
+      result$data
+    )
+    # Formatting
+    openxlsx::addStyle(
+      wb,
+      sheet,
+      treatment_style,
+      rows = 1,
+      cols = seq_len(total_cols),
+      gridExpand = TRUE,
+      stack = TRUE
+    )
+    openxlsx::addStyle(
+      wb,
+      sheet,
+      well_style,
+      rows = 2,
+      cols = seq_len(total_cols),
+      gridExpand = TRUE,
+      stack = TRUE
+    )
+    openxlsx::setColWidths(
+      wb,
+      sheet,
+      cols = 1,
+      widths = 10
+    )
+    openxlsx::setColWidths(
+      wb,
+      sheet,
+      cols = 2:total_cols,
+      widths = 11
+    )
+    # Record QC information
+    qc_rows[[i]] <- data.frame(
+      sheet = sheet,
+      timepoints =
+        length(
+          result$timepoints
+        ),
+      batches =
+        length(files),
+      source_slots_per_batch =
+        paste(
+          result$source_widths,
+          collapse = " + "
+        ),
+      combined_slots_per_treatment =
+        result$block_width,
+      total_columns =
+        total_cols,
+      copy_qc =
+        "PASS",
+      stringsAsFactors = FALSE
+    )
+  }
+  # Save final workbook
+  openxlsx::saveWorkbook(
+    wb,
+    file = output_file,
+    overwrite = TRUE
+  )
+  do.call(
+    rbind,
+    qc_rows
+  )
+}
+```
+
+```{r run-viability, eval=params$run_viability}
+check_ids(names(viability_files), "viability_files names")
+if (anyDuplicated(normalizePath(viability_files, mustWork = TRUE)))
+  stop("A viability input file is listed more than once.")
+normalized_files <- setNames(character(length(viability_files)), names(viability_files))
+normalization_qc <- vector("list", length(viability_files))
+for (i in seq_along(viability_files)) {
+  id <- names(viability_files)[i]
+  normalized_files[i] <- output_path("viability", paste0(id, "_VC100.xlsx"))
+  normalization_qc[[i]] <- normalize_workbook_to_vc(viability_files[i], normalized_files[i])
+  normalization_qc[[i]]$Run_ID <- id
+}
+normalization_qc <- do.call(rbind, normalization_qc)
+combined_output <- output_path("viability", "combined_VC100.xlsx")
+combination_qc <- combine_normalized_workbooks(
+  normalized_files, names(normalized_files), combined_output)
+stopifnot(all(normalization_qc$max_abs_error_from_100 <= QC_TOLERANCE),
+          all(combination_qc$copy_qc == "PASS"))
+openxlsx::write.xlsx(list(Normalization = normalization_qc, Combination = combination_qc),
+                    output_path("viability", "quality_control.xlsx"))
+print(normalization_qc)
+print(combination_qc)
+```
+
+# Bliss independence mixture analysis — Figure S6
+
+## Input and interpretation
+
+The Excel sheet has a `dose` column and replicate columns such as `cd_1`, `cr_1`,
+and `mix_1`. Measurements are percentages of the matched vehicle-control mean.
+At each row, the single-agent doses must match the component doses in the mixture;
+this code does not infer whether a reported mixture dose means total or per-component
+concentration. Inputs must use the same endpoint and exposure time.
+
+Fractional effect is $E=1-Y_{\%VC}/100$, and the expected effect is
+$E_{Bliss}=E_{Cd}+E_{Cr}-E_{Cd}E_{Cr}$. Bliss excess is observed mixture effect
+minus this expectation. Each treatment is bootstrapped independently within dose,
+using percentile intervals. An interval spanning zero is labeled consistent with
+Bliss additivity, not proof of equivalence. This procedure does not model experiment
+clustering, matched samples, or uncertainty in the VC normalization denominator.
+Values outside 0–100% are retained, not clipped; they trigger a warning because
+fractional effects then fall outside the usual probability interpretation.
+
+```{r bliss-functions}
+read_bliss <- function(file, sheet) {
+  check_file(file, sheet)
+  raw <- janitor::clean_names(readxl::read_excel(file, sheet = sheet))
+  if (!"dose" %in% names(raw)) stop("Bliss input requires a dose column.")
+  sample_cols <- setdiff(names(raw), "dose")
+  if (!length(sample_cols) || any(!grepl("^(cd|cr|mix)_[0-9]+$", sample_cols)))
+    stop("Bliss replicate columns must be named cd_1, cr_1, mix_1, etc.")
+  raw$dose <- strict_numeric(raw$dose, "Bliss dose")
+  if (anyNA(raw$dose) || any(raw$dose < 0) || anyDuplicated(raw$dose))
+    stop("Bliss doses must be unique, finite, nonnegative values.")
+  raw[sample_cols] <- lapply(raw[sample_cols], strict_numeric, context = "Bliss measurements")
+  long <- tidyr::pivot_longer(raw, cols = -dose,
+    names_to = c("treatment", "replicate"), names_pattern = "^(cd|cr|mix)_([0-9]+)$",
+    values_to = "percent_ld") %>%
+    dplyr::mutate(replicate = as.integer(replicate), ld_ratio = percent_ld / 100,
+                  effect = 1 - percent_ld / 100)
+  if (any(long$percent_ld < 0 | long$percent_ld > 100, na.rm = TRUE))
+    warning("Bliss input contains values outside 0–100%; no clipping was applied.")
+  long
+}
+bootstrap_bliss <- function(data, n_boot = 5000L, seed = 831L) {
+  if (n_boot < 2 || n_boot != as.integer(n_boot)) stop("n_boot must be an integer >= 2.")
+  set.seed(seed)
+  results <- lapply(unique(data$dose), function(current_dose) {
+    d <- data[data$dose == current_dose, ]
+    values <- lapply(c("cd", "cr", "mix"), function(treatment) {
+      x <- d$effect[d$treatment == treatment]
+      x <- x[is.finite(x)]
+      if (length(x) < 2) stop("At least two finite replicates per treatment are required at dose ", current_dose)
+      x
+    })
+    # Sampling indices avoids R's special interpretation of a length-one numeric vector.
+    draw_mean <- function(x) mean(x[sample.int(length(x), length(x), replace = TRUE)])
+    boot <- replicate(n_boot, {
+      a <- draw_mean(values[[1]]); b <- draw_mean(values[[2]])
+      ab <- draw_mean(values[[3]])
+      ab - (a + b - a * b)
+    })
+    tibble::tibble(dose = current_dose, bootstrap_mean_excess = mean(boot),
+                  ci_lower = unname(stats::quantile(boot, 0.025)),
+                  ci_upper = unname(stats::quantile(boot, 0.975)))
+  })
+  dplyr::bind_rows(results)
+}
+```
+
+```{r run-bliss, eval=params$run_bliss}
+bliss_long <- read_bliss(bliss_input_file, bliss_input_sheet)
+bliss_summary <- bliss_long %>%
+  dplyr::group_by(dose, treatment) %>%
+  dplyr::summarise(mean_effect = mean(effect, na.rm = TRUE),
+    sd_effect = stats::sd(effect, na.rm = TRUE), n = sum(is.finite(effect)),
+    n_missing = sum(!is.finite(effect)), .groups = "drop")
+bliss_ci <- bootstrap_bliss(bliss_long, bliss_bootstrap_iterations, bliss_seed)
+bliss_results <- bliss_summary %>%
+  dplyr::select(dose, treatment, mean_effect) %>%
+  tidyr::pivot_wider(names_from = treatment, values_from = mean_effect) %>%
+  dplyr::mutate(bliss_expected = cd + cr - cd * cr,
+                mix_observed = mix, bliss_excess = mix - bliss_expected) %>%
+  dplyr::left_join(bliss_ci, by = "dose") %>%
+  dplyr::mutate(interaction = dplyr::case_when(
+    ci_upper < 0 ~ "Less than Bliss expectation",
+    ci_lower > 0 ~ "Greater than Bliss expectation",
+    TRUE ~ "Consistent with Bliss additivity"))
+writexl::write_xlsx(list(Replicate_data = bliss_long, Treatment_summary = bliss_summary,
+                         Bliss_results = bliss_results),
+                    output_path("bliss", "Bliss_independence.xlsx"))
+print(bliss_results)
+```
+
+# Sholl outgrowth analysis — Figures S7 and 4b–c
+
+## Profiles, AUC, normalization, and testing
+
+A formatted sheet contains `Radius` followed by replicate columns such as `VC_01`,
+`0.32Cd_01`, `3.2Cr_02`, or `10Mix_03`. `Ctrl_01` and `Control_01` are also accepted
+and standardized to `VC`. A manifest selects each sheet explicitly. Radius must
+already represent the intended distance coordinate; this workflow does not identify
+organoid edges or shift profiles. The default unit is µm, with no automatic pixel
+conversion or subsampling. Set units and sampling explicitly for pixel-based inputs.
+
+AUC is calculated for each profile by linear trapezoidal integration using
+`MESS::auc(type = "linear")`. Missing observations are omitted; this connects the
+remaining finite points across gaps and does not fill gaps with zero. The range and
+number of points are exported. Profiles with fewer than two finite points are
+excluded with an explicit QC status. Different radial ranges can affect AUC and
+must be assessed when interpreting comparisons.
+
+For each assay and source experiment, AUC is divided by the mean VC AUC. The
+normalized VC mean is 1, not 100. Experiment-specific normalization is followed
+by concatenation of replicate observations, without experiment-level averaging.
+Two-sided, unpaired Wilcoxon rank-sum tests use `exact = FALSE` and the default
+continuity correction. BH adjustment applies to **all dose-pair comparisons within
+each metal**, not just the displayed VC comparisons. Tests do not include an
+experiment/block effect. Shared controls are reused for each metal comparison,
+not treated as additional independent observations in the exported replicate table.
+
+```{r outgrowth-functions}
+read_profile_table <- function(file, sheet, step = NULL, unit = "um") {
+  check_file(file, sheet)
+  raw <- readxl::read_excel(file, sheet = sheet, .name_repair = "minimal")
+  if (!"Radius" %in% names(raw) || ncol(raw) < 2 || anyDuplicated(names(raw)))
+    stop("A profile sheet requires one Radius column and unique sample columns: ", file)
+  raw$Radius <- strict_numeric(raw$Radius, paste(file, "Radius"))
+  raw[setdiff(names(raw), "Radius")] <- lapply(raw[setdiff(names(raw), "Radius")],
+      strict_numeric, context = paste(file, "intersections"))
+  if (any(is.na(raw$Radius) & rowSums(!is.na(raw[setdiff(names(raw), "Radius")])) > 0))
+    stop("Intersections have no radius in ", file)
+  raw <- raw[!is.na(raw$Radius), ]
+  if (anyDuplicated(raw$Radius) || any(raw$Radius < 0))
+    stop("Radii must be unique and nonnegative in ", file)
+  if (!is.null(step)) {
+    if (!is.finite(step) || step <= 0) stop("Sampling step must be positive.")
+    raw <- raw[abs(raw$Radius / step - round(raw$Radius / step)) < 1e-8, ]
+  }
+  if (nrow(raw) < 2) stop("Fewer than two radius rows remain in ", file)
+  long <- tidyr::pivot_longer(raw, cols = -Radius, names_to = "Sample", values_to = "Inters")
+  if (any(long$Inters < 0, na.rm = TRUE)) stop("Negative intersection counts in ", file)
+  long$Radius_unit <- unit
+  long
+}
+parse_metal_samples <- function(long, metals = outgrowth_metals) {
+  sample <- trimws(long$Sample)
+  ctrl <- grepl("^(VC|Ctrl|Control)_?[0-9]+$", sample, ignore.case = TRUE)
+  parsed <- stringr::str_match(sample, "^([0-9]+(?:\\.[0-9]+)?)([A-Za-z]+|Cd\\+Cr)_?([0-9]+)$")
+  metal <- ifelse(ctrl, "VC", parsed[, 3])
+  metal[metal == "Cd+Cr"] <- "Mix"
+  dose <- suppressWarnings(as.numeric(parsed[, 2])); dose[ctrl] <- 0
+  rep <- ifelse(ctrl, stringr::str_extract(sample, "[0-9]+$"), parsed[, 4])
+  bad <- is.na(dose) | is.na(metal) | is.na(rep) | !metal %in% c("VC", metals)
+  if (any(bad)) stop("Unrecognized sample names: ", paste(unique(sample[bad]), collapse = ", "))
+  if (any(!ctrl & dose <= 0)) stop("Non-VC treatments must have positive doses.")
+  long %>% dplyr::mutate(Sample = sample, Metal = metal, Dose_uM = dose, Rep = rep)
+}
+profile_auc <- function(long, groups) {
+  long %>% dplyr::group_by(dplyr::across(dplyr::all_of(groups))) %>%
+    dplyr::group_modify(function(dat, key) {
+      ok <- is.finite(dat$Radius) & is.finite(dat$Inters)
+      x <- dat$Radius[ok]; y <- dat$Inters[ok]; ord <- order(x)
+      if (anyDuplicated(x)) stop("A replicate contains duplicated radii; check source identifiers.")
+      n <- length(x)
+      tibble::tibble(AUC = if (n >= 2) MESS::auc(x[ord], y[ord], type = "linear") else NA_real_,
+        n_points = n, n_missing = sum(!ok),
+        x_min = if (n) min(x) else NA_real_, x_max = if (n) max(x) else NA_real_,
+        Status = if (n >= 2) "Included" else "Excluded: fewer than two finite points")
+    }) %>% dplyr::ungroup()
+}
+control_by_metal <- function(dat) {
+  metals <- unique(dat$Metal[dat$Metal != "VC"])
+  vc <- dat %>% dplyr::filter(Metal == "VC", Dose_uM == 0) %>% dplyr::select(-Metal)
+  if (!nrow(vc)) stop("No vehicle controls available.")
+  dplyr::bind_rows(dplyr::filter(dat, Metal != "VC"), tidyr::crossing(vc, Metal = metals))
+}
+wilcox_result <- function(x, y, exact = FALSE, minimum_n = 1L) {
+  x <- x[is.finite(x)]; y <- y[is.finite(y)]
+  warnings <- character()
+  test <- if (length(x) >= minimum_n && length(y) >= minimum_n) {
+    tryCatch(withCallingHandlers(stats::wilcox.test(x, y, alternative = "two.sided",
+      paired = FALSE, exact = exact, correct = TRUE), warning = function(w) {
+        warnings <<- c(warnings, conditionMessage(w)); invokeRestart("muffleWarning")
+      }), error = function(e) { warnings <<- conditionMessage(e); NULL })
+  } else NULL
+  p <- if (is.null(test)) NA_real_ else test$p.value
+  tibble::tibble(n1 = length(x), n2 = length(y),
+    median1 = if (length(x)) stats::median(x) else NA_real_,
+    median2 = if (length(y)) stats::median(y) else NA_real_,
+    W = if (is.null(test)) NA_real_ else unname(test$statistic), p = p,
+    low_n_flag = length(x) < 3 || length(y) < 3,
+    Test_Status = if (is.finite(p)) "Tested" else "Not estimable or insufficient n",
+    Test_Warning = paste(warnings, collapse = "; "))
+}
+pairwise_metals <- function(dat, value, minimum_n, exact = FALSE) {
+  purrr::map_dfr(sort(unique(dat$Metal)), function(m) {
+    d <- dat[dat$Metal == m, ]; doses <- sort(unique(d$Dose_uM))
+    if (length(doses) < 2) stop("At least two doses including VC are required for ", m)
+    pairs <- utils::combn(doses, 2)
+    purrr::map_dfr(seq_len(ncol(pairs)), function(i) {
+      a <- pairs[1, i]; b <- pairs[2, i]
+      dplyr::bind_cols(tibble::tibble(Metal = m, dose1 = a, dose2 = b),
+        wilcox_result(d[[value]][d$Dose_uM == a], d[[value]][d$Dose_uM == b], exact, minimum_n))
+    }) %>% dplyr::mutate(p_adj = stats::p.adjust(p, method = wilcoxon_adjustment))
+  })
+}
+auc_summary <- function(dat, value, groups) {
+  dat %>% dplyr::filter(is.finite(.data[[value]])) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(groups))) %>%
+    dplyr::summarise(n = dplyr::n(), mean = mean(.data[[value]]),
+      SD = stats::sd(.data[[value]]), SEM = SD / sqrt(n),
+      median = stats::median(.data[[value]]),
+      CV_percent = if (mean != 0) 100 * SD / mean else NA_real_, .groups = "drop")
+}
+normality_summary <- function(dat, value, groups) {
+  dat %>% dplyr::group_by(dplyr::across(dplyr::all_of(groups))) %>%
+    dplyr::group_modify(function(d, key) {
+      x <- d[[value]][is.finite(d[[value]])]
+      valid <- length(x) >= 3 && length(x) <= 5000 && length(unique(x)) > 1
+      tibble::tibble(n = length(x), shapiro_p = if (valid) stats::shapiro.test(x)$p.value else NA_real_,
+                    Status = if (valid) "Tested" else "Requires 3–5000 nonconstant observations")
+    }) %>% dplyr::ungroup()
+}
+plot_metal_auc <- function(dat, tests, value, title, cutoff, normalized = FALSE) {
+  stopifnot(plot_error %in% c("SD", "SEM"))
+  d <- control_by_metal(dat) %>% dplyr::filter(is.finite(.data[[value]])) %>%
+    dplyr::mutate(Dose_f = factor(Dose_uM, levels = outgrowth_doses_uM))
+  s <- auc_summary(d, value, c("Metal", "Dose_f")); s$Error <- s[[plot_error]]
+  p <- ggplot2::ggplot(d, ggplot2::aes(Dose_f, .data[[value]], fill = Dose_f)) +
+    ggplot2::geom_col(data = s, ggplot2::aes(y = mean), width = 0.65) +
+    ggplot2::geom_errorbar(data = s, ggplot2::aes(y = mean, ymin = mean - Error, ymax = mean + Error), width = 0.2) +
+    ggplot2::geom_point(shape = 21, position = ggplot2::position_jitter(width = 0.08, height = 0, seed = plot_seed)) +
+    ggplot2::facet_wrap(~Metal, nrow = 1) + ggplot2::theme_classic() +
+    ggplot2::theme(legend.position = "none") +
+    ggplot2::labs(title = title, subtitle = paste("Mean ±", plot_error),
+      x = "Exposure (µM)", y = if (normalized) "AUC / experiment VC mean" else "AUC")
+  if (normalized) p <- p + ggplot2::geom_hline(yintercept = 0.5, linetype = "dashed")
+  ann <- tests %>% dplyr::filter(dose1 == 0, is.finite(p_adj), p_adj < cutoff) %>%
+    dplyr::mutate(group1 = as.character(dose1), group2 = as.character(dose2),
+      label = ifelse(p_adj < 0.001, "<0.001", sprintf("%.3f", p_adj)))
+  if (nrow(ann)) {
+    ymax <- d %>% dplyr::group_by(Metal) %>%
+      dplyr::summarise(y0 = max(.data[[value]], na.rm = TRUE), .groups = "drop")
+    ann <- ann %>% dplyr::left_join(ymax, by = "Metal") %>% dplyr::group_by(Metal) %>%
+      dplyr::mutate(y.position = pmax(y0, 1e-6) * (1.1 + 0.08 * (dplyr::row_number() - 1))) %>%
+      dplyr::ungroup()
+    p <- p + ggpubr::stat_pvalue_manual(ann, label = "label", xmin = "group1", xmax = "group2",
+                y.position = "y.position", inherit.aes = FALSE, tip.length = 0.01)
+  }
+  p
+}
+```
+
+## Shared profile summaries and comparison plots
+
+```{r profile-comparison-helpers}
+read_profile_manifest <- function(manifest, step, unit, scale = 1) {
+  needed <- c("Source_ID", "File", "Sheet")
+  if (!all(needed %in% names(manifest)) || !nrow(manifest)) stop("A profile manifest requires Source_ID, File and Sheet.")
+  check_ids(manifest$Source_ID, "Profile source IDs")
+  if (anyDuplicated(paste(normalizePath(manifest$File, mustWork = TRUE), manifest$Sheet)))
+    stop("The same file/sheet is listed more than once.")
+  if (!is.finite(scale) || scale <= 0) stop("Radius scale must be positive.")
+  purrr::map_dfr(seq_len(nrow(manifest)), function(i) {
+    row <- manifest[i, ]
+    d <- read_profile_table(row$File, row$Sheet, step, unit)
+    d$Radius <- d$Radius * scale
+    d$Source_ID <- row$Source_ID
+    d$Sample_UID <- paste(row$Source_ID, d$Sample, sep = "__")
+    for (name in setdiff(names(manifest), c("File", "Sheet", "Source_ID"))) d[[name]] <- row[[name]]
+    d
+  })
+}
+profile_summary <- function(long, group) {
+  long %>% dplyr::filter(is.finite(Inters)) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(group)), Radius) %>%
+    dplyr::summarise(n = dplyr::n(), mean_intersections = mean(Inters),
+      SD = stats::sd(Inters), SEM = SD / sqrt(n),
+      CI95_half_width = if (n > 1) stats::qt(0.975, n - 1) * SEM else NA_real_,
+      .groups = "drop")
+}
+plot_profiles <- function(summary, group, title, unit, ribbon = "SEM") {
+  stopifnot(ribbon %in% c("SEM", "SD", "CI95_half_width"))
+  s <- summary; s$Error <- s[[ribbon]]
+  ggplot2::ggplot(s, ggplot2::aes(Radius, mean_intersections,
+      color = .data[[group]], fill = .data[[group]])) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = mean_intersections - Error,
+      ymax = mean_intersections + Error), alpha = 0.18, color = NA) +
+    ggplot2::geom_line(linewidth = 0.8) + ggplot2::theme_classic() +
+    ggplot2::labs(title = title, subtitle = paste("Mean with", ribbon, "ribbon"),
+      x = paste0("Distance from organoid edge (", unit, ")"), y = "Intersections", color = NULL, fill = NULL)
+}
+plot_group_auc <- function(dat, group, value, tests, title, normalized = FALSE) {
+  p <- ggplot2::ggplot(dat, ggplot2::aes(.data[[group]], .data[[value]], fill = .data[[group]])) +
+    ggplot2::geom_boxplot(outlier.shape = NA, alpha = 0.6, width = 0.65) +
+    ggplot2::geom_point(shape = 21, position = ggplot2::position_jitter(width = 0.12, height = 0, seed = plot_seed)) +
+    ggplot2::theme_classic() + ggplot2::theme(legend.position = "none") +
+    ggplot2::labs(title = title, x = NULL, y = if (normalized) "AUC / control mean" else "AUC")
+  if (normalized) p <- p + ggplot2::geom_hline(yintercept = 1, linetype = "dashed")
+  ann <- tests[is.finite(tests$p), ]
+  if (nrow(ann)) {
+    y0 <- max(dat[[value]], na.rm = TRUE)
+    ann$y.position <- pmax(y0, 1e-6) * (1.08 + 0.08 * seq_len(nrow(ann)))
+    ann$label <- ifelse(ann$p < 0.001, "p < 0.001", paste0("p = ", sprintf("%.3f", ann$p)))
+    p <- p + ggpubr::stat_pvalue_manual(ann, label = "label", xmin = "group1", xmax = "group2",
+      y.position = "y.position", inherit.aes = FALSE, tip.length = 0.01)
+  }
+  p
+}
+```
+
+```{r run-outgrowth, eval=params$run_outgrowth}
+required_cols <- c("Assay", "Run_ID", "File", "Sheet")
+if (!all(required_cols %in% names(outgrowth_inputs)) || !nrow(outgrowth_inputs))
+  stop("outgrowth_inputs requires Assay, Run_ID, File and Sheet.")
+check_ids(unique(outgrowth_inputs$Assay), "Assay IDs")
+for (assay in unique(outgrowth_inputs$Assay))
+  check_ids(outgrowth_inputs$Run_ID[outgrowth_inputs$Assay == assay], "Run IDs within each assay")
+if (anyDuplicated(paste(normalizePath(outgrowth_inputs$File, mustWork = TRUE), outgrowth_inputs$Sheet)))
+  stop("The same outgrowth file/sheet is listed twice.")
+all_auc <- vector("list", nrow(outgrowth_inputs))
+for (i in seq_len(nrow(outgrowth_inputs))) {
+  spec <- outgrowth_inputs[i, ]; prefix <- paste(spec$Assay, spec$Run_ID, sep = "_")
+  long <- read_profile_table(spec$File, spec$Sheet, outgrowth_radius_step, outgrowth_radius_unit) %>%
+    parse_metal_samples() %>% dplyr::filter(Dose_uM %in% outgrowth_doses_uM) %>%
+    dplyr::mutate(Assay = spec$Assay, Run_ID = spec$Run_ID, Source_File = basename(spec$File))
+  auc <- profile_auc(long, c("Assay", "Run_ID", "Source_File", "Sample", "Metal", "Dose_uM", "Rep"))
+  vc <- auc$AUC[auc$Metal == "VC" & is.finite(auc$AUC)]
+  if (!length(vc) || mean(vc) <= 0) stop("Missing or nonpositive VC AUC for ", prefix)
+  auc <- auc %>% dplyr::mutate(Raw_AUC = AUC, VC_mean_AUC = mean(vc),
+    Normalized_AUC = AUC / mean(vc), Sample_UID = paste(Assay, Run_ID, Sample, sep = "__"))
+  tests <- pairwise_metals(control_by_metal(auc), "AUC", single_run_min_n, outgrowth_exact)
+  raw_summary <- auc_summary(auc, "AUC", c("Metal", "Dose_uM"))
+  norm_summary <- auc_summary(auc, "Normalized_AUC", c("Metal", "Dose_uM"))
+  normality <- normality_summary(auc, "AUC", c("Metal", "Dose_uM"))
+  curve_summary <- profile_summary(control_by_metal(long), c("Metal", "Dose_uM"))
+  curve_summary$Dose_label <- factor(curve_summary$Dose_uM, levels = outgrowth_doses_uM)
+  p_curve <- plot_profiles(curve_summary, "Dose_label", prefix, outgrowth_radius_unit) +
+    ggplot2::facet_wrap(~Metal, nrow = 1, scales = "free_y")
+  ggplot2::ggsave(output_path("outgrowth", paste0(prefix, "_intersection_traces.png")),
+                 p_curve, width = 12, height = 4, dpi = 300)
+  print(p_curve)
+  writexl::write_xlsx(list(Long_profiles = long, Normalized_AUC_per_replicate = auc,
+    Raw_summary = raw_summary, Normalized_summary = norm_summary, Curve_summary = curve_summary,
+    Pairwise_Wilcoxon = tests, Normality = normality),
+    output_path("outgrowth", paste0(prefix, "_AUC.xlsx")))
+  readr::write_csv(auc, output_path("outgrowth", paste0(prefix, "_normalized_AUC_per_replicate.csv")))
+  for (metric in c("AUC", "Normalized_AUC")) {
+    p <- plot_metal_auc(auc, tests, metric, prefix, single_run_display_cutoff, metric == "Normalized_AUC")
+    ggplot2::ggsave(output_path("outgrowth", paste0(prefix, "_", metric, ".png")), p, width = 12, height = 5, dpi = 300)
+    print(p)
+  }
+  all_auc[[i]] <- auc
+}
+outgrowth_all <- dplyr::bind_rows(all_auc)
+for (assay in unique(outgrowth_all$Assay)) {
+  d <- outgrowth_all %>% dplyr::filter(Assay == assay, is.finite(Normalized_AUC))
+  qc <- d %>% dplyr::filter(Metal == "VC") %>% dplyr::group_by(Run_ID) %>%
+    dplyr::summarise(n_VC = dplyr::n(), mean_VC = mean(Normalized_AUC), .groups = "drop")
+  stopifnot(all(abs(qc$mean_VC - 1) <= QC_TOLERANCE), !anyDuplicated(d$Sample_UID))
+  tests <- pairwise_metals(control_by_metal(d), "Normalized_AUC", pooled_min_n, FALSE)
+  summary <- auc_summary(d, "Normalized_AUC", c("Metal", "Dose_uM"))
+  sources <- d %>% dplyr::group_by(Metal, Dose_uM) %>%
+    dplyr::summarise(n_sources = dplyr::n_distinct(Run_ID), .groups = "drop")
+  summary <- dplyr::left_join(summary, sources, by = c("Metal", "Dose_uM"))
+  writexl::write_xlsx(list(Combined_per_replicate = d, Pooled_summary = summary,
+    Pairwise_Wilcoxon = tests, VC_comparisons = dplyr::filter(tests, dose1 == 0), Source_QC = qc),
+    output_path("outgrowth", paste0(assay, "_combined_AUC.xlsx")))
+  readr::write_csv(d, output_path("outgrowth", paste0(assay, "_combined_normalized_AUC_per_replicate.csv")))
+  p <- plot_metal_auc(d, tests, "Normalized_AUC", paste(assay, "combined"), pooled_display_cutoff, TRUE)
+  ggplot2::ggsave(output_path("outgrowth", paste0(assay, "_combined_AUC.png")), p, width = 12, height = 5, dpi = 300)
+  print(p)
+}
+```
+
+# Outgrowth concentration–response fitting — Figure 4d
+
+The model fixes the upper and lower asymptotes at 100 and 0, respectively:
+
+\[
+Y=\frac{100}{1+10^{h(\log_{10}IC_{50}-\log_{10}x)}}.
+\]
+
+The Hill slope is constrained to [-100, 0] (negative slopes give decreasing
+responses in this parameterization), and log10(IC50) to [-12, log10(1000)]. Vehicle
+predictions are fixed at 100; VC observations still contribute to residual statistics.
+Multiple starting values are fitted with `minpack.lm::nlsLM`; the successful candidate
+with the lowest residual sum of squares is retained. Inputs are replicate-level
+normalized AUC **ratios**, multiplied by 100 internally. ML and NO are fitted separately.
+
+The active source workflow used `confint()` for nonlinear-model profile intervals;
+its separately defined extra-sum-of-squares profiling helper was never called.
+Only the active method is retained. Raw interval estimates and their status are
+exported. The source's capped upper-limit column is also retained, but a failed
+interval is explicitly labeled unestimated rather than evidence that IC50 exceeds
+the cap. An extrapolated or boundary-limited IC50 requires cautious interpretation.
+
+```{r ic50-model-functions}
+# Prism-style normalized inhibitor-response model
+#
+# Top = 100
+# Bottom = 0
+#
+# Y = 100 / [1 + (IC50/X)^HillSlope]
+dose_response <- function(
+  x,
+  logIC50,
+  HillSlope
+) {
+  # Avoid log10(0)
+  x_safe <- pmax(
+    x,
+    1e-12
+  )
+  y <- 100 / (
+    1 +
+      10^(
+        HillSlope *
+          (
+            logIC50 -
+              log10(x_safe)
+          )
+      )
+  )
+  # Vehicle control
+  y[x == 0] <- 100
+  y
+}
+# -----------------------------------------------------------------------------
+# Fit one dose-response curve
+# -----------------------------------------------------------------------------
+fit_ic50 <- function(dat) {
+  # Try multiple starting IC50 and HillSlope values.
+  # Multiple starts reduce sensitivity to the initial parameter guess.
+  starts <- expand.grid(
+    logIC50 = log10(
+      c(
+        0.32,
+        1,
+        3.2,
+        10,
+        30,
+        100,
+        300
+      )
+    ),
+    HillSlope = c(
+      -0.5,
+      -1,
+      -2,
+      -5,
+      -10,
+      -20
+    )
+  )
+  candidate_fits <- lapply(
+    seq_len(nrow(starts)),
+    function(i) {
+      tryCatch(
+        nlsLM(
+          Response ~
+            dose_response(
+              Dose_uM,
+              logIC50,
+              HillSlope
+            ),
+          data = dat,
+          start = list(
+            logIC50 =
+              starts$logIC50[i],
+            HillSlope =
+              starts$HillSlope[i]
+          ),
+          lower = c(
+            logIC50 = -12,
+            HillSlope = -100
+          ),
+          upper = c(
+            logIC50 = max_logIC50,
+            HillSlope = 0
+          ),
+          control = nls.lm.control(
+            maxiter = max_iterations
+          )
+        ),
+        error = function(e) {
+          NULL
+        }
+      )
+    }
+  )
+  # Remove failed starting points
+  candidate_fits <- Filter(function(x) !is.null(x) && isTRUE(x$convInfo$isConv), candidate_fits)
+  if (length(candidate_fits) == 0) {
+    stop(
+      "No valid nonlinear fit could be obtained."
+    )
+  }
+  # Calculate residual sum of squares
+  RSS <- sapply(
+    candidate_fits,
+    function(fit) {
+      sum(
+        residuals(fit)^2
+      )
+    }
+  )
+  # Keep the best-fitting solution
+  candidate_fits[[which.min(RSS)]]
+}
+```
+
+```{r ic50-results-function}
+get_ic50_results <- function(fit) {
+  # Best-fit parameters
+  pars <- coef(fit)
+  logIC50 <- unname(pars["logIC50"])
+  HillSlope <- unname(pars["HillSlope"])
+  IC50 <- 10^logIC50
+  # ---------------------------------------------------------------------------
+  # 95% profile-likelihood confidence intervals
+  # ---------------------------------------------------------------------------
+  CI <- tryCatch(
+    suppressMessages(
+      confint(
+        fit,
+        level = 0.95
+      )
+    ),
+    error = function(e) {
+      matrix(
+        NA_real_,
+        nrow = 2,
+        ncol = 2,
+        dimnames = list(
+          c("logIC50", "HillSlope"),
+          c("2.5%", "97.5%")
+        )
+      )
+    }
+  )
+  # ---------------------------------------------------------------------------
+  # IC50 confidence interval
+  # ---------------------------------------------------------------------------
+  logIC50_lower <- CI["logIC50", 1]
+  logIC50_upper <- CI["logIC50", 2]
+  IC50_lower <- 10^logIC50_lower
+  IC50_upper <- 10^logIC50_upper
+  # Preserve unmodified estimates separately from the source-style display cap.
+  raw_lower <- IC50_lower
+  raw_upper <- IC50_upper
+  ci_status <- if (is.na(raw_lower) || is.na(raw_upper)) "Not fully estimated" else
+    if (!is.finite(raw_lower) || !is.finite(raw_upper)) "Unbounded" else "Estimated"
+  # A capped or unresolved interval is not a finite confidence bound.
+  upper_capped <- (
+    is.na(IC50_upper) ||
+    is.infinite(IC50_upper) ||
+    IC50_upper >= max_IC50
+  )
+  if (upper_capped) {
+    IC50_upper <- max_IC50
+    logIC50_upper <- max_logIC50
+  }
+  IC50_CI_text <- if (ci_status == "Not fully estimated") {
+    "Not fully estimated; inspect raw bounds"
+  } else paste0(signif(raw_lower, 4), " to ",
+    if (upper_capped) paste0(">=", max_IC50, " (reporting cap)") else signif(raw_upper, 4))
+  # ---------------------------------------------------------------------------
+  # Goodness of fit
+  # ---------------------------------------------------------------------------
+  residuals_fit <- residuals(fit)
+  fitted_values <- fitted(fit)
+  # Reconstruct observed Y values
+  observed <- fitted_values + residuals_fit
+  RSS <- sum(
+    residuals_fit^2
+  )
+  TSS <- sum(
+    (observed - mean(observed))^2
+  )
+  df <- df.residual(fit)
+  R_squared <- if (TSS > 0) 1 - RSS / TSS else NA_real_
+  Sy_x <- sqrt(
+    RSS / df
+  )
+  # ---------------------------------------------------------------------------
+  # Return results
+  # ---------------------------------------------------------------------------
+  tibble(
+    IC50_uM = IC50,
+    Raw_IC50_lower_95_uM = raw_lower,
+    Raw_IC50_upper_95_uM = raw_upper,
+    CI_Status = ci_status,
+    Parameter_boundary = abs(logIC50 - max_logIC50) < 1e-6 || abs(logIC50 + 12) < 1e-6 ||
+                         abs(HillSlope) < 1e-6 || abs(HillSlope + 100) < 1e-6,
+    IC50_lower_95_uM = IC50_lower,
+    IC50_upper_95_uM = IC50_upper,
+    IC50_95_CI = IC50_CI_text,
+    HillSlope = HillSlope,
+    HillSlope_lower_95 = CI["HillSlope", 1],
+    HillSlope_upper_95 = CI["HillSlope", 2],
+    logIC50 = logIC50,
+    logIC50_lower_95 = logIC50_lower,
+    logIC50_upper_95 = logIC50_upper,
+    Degrees_of_Freedom = df,
+    R_squared = R_squared,
+    Sum_of_Squares = RSS,
+    Sy_x = Sy_x,
+    Number_of_points = length(observed),
+    IC50_upper_capped = upper_capped
+  )
+}
+```
+
+```{r run-ic50, eval=params$run_ic50}
+check_ids(names(ic50_files), "ic50_files assay names")
+ic50_data <- purrr::imap_dfr(ic50_files, function(path, assay) {
+  check_file(path)
+  d <- readr::read_csv(path, show_col_types = FALSE)
+  if (!all(c("Metal", "Dose_uM", "Normalized_AUC") %in% names(d)))
+    stop("IC50 inputs require Metal, Dose_uM and Normalized_AUC: ", path)
+  d$Dose_uM <- strict_numeric(d$Dose_uM, "IC50 dose")
+  d$Normalized_AUC <- strict_numeric(d$Normalized_AUC, "IC50 response")
+  if (any(d$Dose_uM < 0, na.rm = TRUE)) stop("IC50 doses cannot be negative.")
+  d %>% dplyr::mutate(Assay_ID = assay, Response = Normalized_AUC * 100)
+})
+fits <- list()
+ic50_results <- purrr::map_dfr(names(ic50_files), function(assay) {
+  purrr::map_dfr(ic50_metals, function(metal) {
+    d <- ic50_data %>% dplyr::filter(Assay_ID == assay, Metal %in% c("VC", metal),
+                                    is.finite(Dose_uM), is.finite(Response))
+    result <- tryCatch({
+      if (nrow(d) <= 2 || length(unique(d$Dose_uM[d$Dose_uM > 0])) < 2)
+        stop("At least two distinct positive doses and >2 observations required.")
+      fit <- fit_ic50(d)
+      fits[[paste(assay, metal, sep = "_")]] <<- fit
+      get_ic50_results(fit) %>% dplyr::mutate(Fit_Status = "Fitted", Fit_Message = "")
+    }, error = function(e) tibble::tibble(Fit_Status = "Failed", Fit_Message = conditionMessage(e)))
+    dplyr::bind_cols(tibble::tibble(Assay = assay, Metal = metal), result)
+  })
+})
+writexl::write_xlsx(list(IC50_results = ic50_results), output_path("ic50", "Outgrowth_IC50.xlsx"))
+saveRDS(fits, output_path("ic50", "Outgrowth_IC50_fits.rds"))
+print(ic50_results)
+```
+
+# MortaLIVE compatibility validation — Figure 1d–e
+
+The β-III-tubulin and GFAP datasets are processed separately. Each sample is assigned
+to an unstained control or a MortaLIVE dilution from its column name. AUC is integrated
+in the configured radius units, then divided by the pooled control mean **within
+that marker dataset**, following the validation scripts. This normalization differs
+from the experiment-specific normalization used for exposure analyses above.
+
+Each dilution is compared with control using a two-sided, unpaired Wilcoxon rank-sum
+test. Normalized-AUC tests use `exact = FALSE`, with no multiplicity adjustment, as
+in both validation scripts. For provenance, raw-AUC tests retain the GFAP script's
+`exact = TRUE` request for the lower dilution and `FALSE` for the other comparisons;
+R may fall back to an approximation in the presence of ties. All warnings are exported.
+Changing exact-test settings can change p-values even though positive scaling
+preserves ranks. Box plots show the median and IQR, with whiskers to the most extreme
+observations within 1.5 IQR; points display the individual observations.
+
+
+
+```{r run-validation, eval=params$run_validation}
+if (!"Marker" %in% names(validation_inputs)) stop("validation_inputs requires a Marker column.")
+check_ids(unique(validation_inputs$Marker), "Marker IDs")
+validation_long <- read_profile_manifest(validation_inputs, validation_radius_step,
+                                         validation_radius_unit, validation_radius_scale)
+validation_long <- validation_long %>% dplyr::mutate(
+  Group = dplyr::case_when(
+    grepl("^(ctrl|control|VC)", Sample, ignore.case = TRUE) ~ "Ctrl",
+    TRUE ~ sub("_[0-9]+$", "", Sample)))
+if (any(!validation_long$Group %in% validation_groups))
+  stop("Unrecognized validation sample(s): ", paste(unique(validation_long$Sample[!validation_long$Group %in% validation_groups]), collapse = ", "))
+for (marker in unique(validation_long$Marker)) {
+  d <- validation_long[validation_long$Marker == marker, ]
+  d$Group <- factor(d$Group, levels = validation_groups)
+  auc <- profile_auc(d, c("Marker", "Source_ID", "Sample", "Sample_UID", "Group"))
+  ctrl <- auc$AUC[auc$Group == "Ctrl" & is.finite(auc$AUC)]
+  if (!length(ctrl) || mean(ctrl) <= 0) stop("Invalid control AUC for ", marker)
+  auc$AUC_norm <- auc$AUC / mean(ctrl)
+  # Zero AUC gives log2FC = -Inf; no pseudocount is introduced.
+  auc$log2FC <- log2(auc$AUC_norm)
+  tables <- lapply(c("AUC", "AUC_norm"), function(value) {
+    purrr::map_dfr(setdiff(validation_groups, "Ctrl"), function(group) {
+      exact <- value == "AUC" && marker == "GFAP" && group == "0.0005ML"
+      dplyr::bind_cols(tibble::tibble(group1 = "Ctrl", group2 = group,
+                                    Metric = value, Exact_requested = exact),
+        wilcox_result(auc[[value]][auc$Group == "Ctrl"], auc[[value]][auc$Group == group], exact))
+    })
+  })
+  tests <- dplyr::bind_rows(tables)
+  summary <- profile_summary(d, "Group")
+  norm_summary <- auc_summary(auc, "AUC_norm", "Group")
+  writexl::write_xlsx(list(Long_profiles = d, AUC_per_replicate = auc,
+    Normalized_summary = norm_summary, Profile_summary = summary, Wilcoxon = tests),
+    output_path("validation", paste0(marker, "_validation.xlsx")))
+  p_curve <- plot_profiles(summary, "Group", paste(marker, "validation"), validation_radius_unit)
+  p_raw <- plot_group_auc(auc, "Group", "AUC", tests[tests$Metric == "AUC", ], paste(marker, "raw AUC"))
+  p_norm <- plot_group_auc(auc, "Group", "AUC_norm", tests[tests$Metric == "AUC_norm", ],
+                           paste(marker, "normalized AUC"), TRUE)
+  for (name in c("curve", "raw", "normalized")) {
+    p <- switch(name, curve = p_curve, raw = p_raw, normalized = p_norm)
+    ggplot2::ggsave(output_path("validation", paste0(marker, "_", name, ".png")), p, width = 8, height = 5, dpi = 300)
+    print(p)
+  }
+}
+```
+
+# MortaLIVE versus immunofluorescence — Figure 3c–d
+
+A manifest assigns each workbook/sheet to a measurement method; filenames do not
+need to encode method. The same function can reproduce the two-method comparison
+or the β-III-tubulin/GFAP/ML comparison. An additional combined-marker input may
+be included if measured profiles are available. Combined-marker intersections
+are **not calculated by adding separate marker counts**, which can double-count
+spatially overlapping intersections.
+
+Profile plots show mean intersections with SEM by default, matching the scripts.
+`comparison_ribbon = "CI95_half_width"` explicitly requests a pointwise Student-t
+95% confidence interval; this is an option, not the original script's calculation.
+The summary exports both quantities and the peak radius of the mean profile.
+
+AUC comparisons use unpaired, two-sided Wilcoxon rank-sum tests (`exact = FALSE`),
+with no multiplicity correction. Each configured comparator is tested against ML.
+Even when sample suffixes identify matched organoids, the original scripts used
+unpaired tests. This workflow retains that choice and does not silently substitute
+a paired analysis. Biological pairing must be considered separately when interpreting
+or revising the statistical plan.
+
+```{r run-method-comparison, eval=params$run_comparison}
+if (!"Method" %in% names(comparison_inputs)) stop("comparison_inputs requires a Method column (NA permits name parsing).")
+comparison_long <- read_profile_manifest(comparison_inputs, comparison_radius_step,
+                                         comparison_radius_unit, comparison_radius_scale)
+# Method may be omitted only for columns carrying an explicit _IF_ or _ML_ token.
+missing_method <- is.na(comparison_long$Method) | comparison_long$Method == ""
+parsed_method <- ifelse(grepl("_IF_", comparison_long$Sample), "IF",
+                  ifelse(grepl("_ML_", comparison_long$Sample), "ML", NA_character_))
+comparison_long$Method[missing_method] <- parsed_method[missing_method]
+if (anyNA(comparison_long$Method)) stop("Specify a Method for every comparison input.")
+if (!comparison_reference %in% comparison_long$Method) stop("Reference method not present.")
+comparison_long$Method <- factor(comparison_long$Method,
+  levels = c(setdiff(unique(comparison_long$Method), comparison_reference), comparison_reference))
+comparison_auc <- profile_auc(comparison_long, c("Source_ID", "Sample", "Sample_UID", "Method"))
+comparison_summary <- profile_summary(comparison_long, "Method")
+comparison_peaks <- comparison_summary %>% dplyr::group_by(Method) %>%
+  dplyr::filter(mean_intersections == max(mean_intersections)) %>% dplyr::ungroup()
+comparators <- setdiff(levels(comparison_long$Method), comparison_reference)
+if (!length(comparators)) stop("At least one comparator method is required.")
+comparison_tests <- purrr::map_dfr(comparators, function(method) {
+  dplyr::bind_cols(tibble::tibble(group1 = method, group2 = comparison_reference),
+    wilcox_result(comparison_auc$AUC[comparison_auc$Method == method],
+                  comparison_auc$AUC[comparison_auc$Method == comparison_reference], FALSE))
+})
+comparison_auc_summary <- auc_summary(comparison_auc, "AUC", "Method")
+writexl::write_xlsx(list(Long_profiles = comparison_long, Profile_summary = comparison_summary,
+  Mean_profile_peaks = comparison_peaks, AUC_per_replicate = comparison_auc,
+  AUC_summary = comparison_auc_summary, Wilcoxon = comparison_tests),
+  output_path("method_comparison", "ML_IF_comparison.xlsx"))
+p_trace <- plot_profiles(comparison_summary, "Method", "Outgrowth profiles", comparison_radius_unit, comparison_ribbon)
+p_auc <- plot_group_auc(comparison_auc, "Method", "AUC", comparison_tests, "MortaLIVE and immunofluorescence AUC")
+ggplot2::ggsave(output_path("method_comparison", "intersection_traces.png"), p_trace, width = 9, height = 5, dpi = 300)
+ggplot2::ggsave(output_path("method_comparison", "raw_AUC_comparison.png"), p_auc, width = 8, height = 5, dpi = 300)
+print(p_trace)
+print(p_auc)
+```
+
+# Optional Fiji Sholl CSV assembly
+
+This utility combines `*_Sholl-Profiles.csv` files within each immediate subfolder
+of a configured parent directory. CSVs must contain `Radius` and `Inters.`. Profiles
+are joined on the actual radius values, preserving missing cells. Distances are not
+rebased to the organoid edge. Duplicate sample names or radii stop the import.
+
+Output columns retain file-derived sample IDs. These IDs must be mapped to the
+appropriate exposure or validation labels before running the figure analyses.
+This utility does not implement a plate map or infer experimental conditions.
+
+```{r sholl-assembly-functions}
+extract_sample_name <- function(file_path, folder_name) {
+  name <- sub("\\.tif_Sholl-Profiles\\.csv$", "", basename(file_path))
+  name <- sub("_Sholl-Profiles\\.csv$", "", name)
+  if (startsWith(name, folder_name)) name <- substring(name, nchar(folder_name) + 1L)
+  well <- stringr::str_extract(name, "[A-Z]-[0-9]+_F[0-9]+")
+  if (is.na(well)) name else well
+}
+combine_sholl_folder <- function(folder) {
+  files <- sort(list.files(folder, pattern = "_Sholl-Profiles\\.csv$", full.names = TRUE, recursive = TRUE))
+  if (!length(files)) return(NULL)
+  ids <- vapply(files, extract_sample_name, character(1), folder_name = basename(folder))
+  if (any(ids == "") || anyDuplicated(ids)) stop("Duplicate or empty profile IDs in ", folder)
+  profiles <- lapply(seq_along(files), function(i) {
+    raw <- utils::read.csv(files[i], check.names = FALSE)
+    if (!all(c("Radius", "Inters.") %in% names(raw))) stop("Missing Radius or Inters. in ", files[i])
+    d <- data.frame(Radius = strict_numeric(raw$Radius, files[i]),
+                    Intersections = strict_numeric(raw[["Inters."]], files[i]))
+    if (anyNA(d$Radius) || anyDuplicated(d$Radius)) stop("Missing or duplicate radii in ", files[i])
+    names(d)[2] <- ids[i]
+    d
+  })
+  combined <- Reduce(function(x, y) merge(x, y, by = "Radius", all = TRUE, sort = TRUE), profiles)
+  path <- output_path("sholl_assembly", paste0(basename(folder), "_Sholl_Combined.xlsx"))
+  writexl::write_xlsx(list(Sholl = combined, Sources = data.frame(Sample = ids, Source_File = basename(files))), path)
+  data.frame(Folder = basename(folder), Profiles = length(files), Output = path)
+}
+```
+
+```{r run-sholl-assembly, eval=params$run_sholl_assembly}
+if (!dir.exists(sholl_parent_dir)) stop("Sholl parent directory not found: ", sholl_parent_dir)
+folders <- list.dirs(sholl_parent_dir, recursive = FALSE, full.names = TRUE)
+if (!length(folders)) stop("No condition subfolders found.")
+assembly_manifest <- dplyr::bind_rows(lapply(folders, combine_sholl_folder))
+if (!nrow(assembly_manifest)) stop("No matching Sholl CSV files found.")
+print(assembly_manifest)
+```
+
+# Reproducibility record
+
+The report records the software environment and enabled analyses. Experimental data
+are not bundled with this workflow. An analysis run should retain its configured
+notebook, input data, outputs, and session information together.
+
+```{r session-information}
+print(params)
+print(sessionInfo())
+if (any(unlist(params[c("run_viability", "run_bliss", "run_outgrowth", "run_ic50",
+                        "run_validation", "run_comparison", "run_sholl_assembly")]))) {
+  writeLines(capture.output(sessionInfo()), output_path("", "sessionInfo.txt"))
+  settings <- mget(c("params", "viability_files", "treatment_order", "viability_max_time_h",
+    "bliss_input_file", "bliss_input_sheet", "bliss_bootstrap_iterations", "bliss_seed",
+    "outgrowth_inputs", "outgrowth_doses_uM", "outgrowth_radius_step", "outgrowth_radius_unit",
+    "outgrowth_exact", "wilcoxon_adjustment", "plot_error", "single_run_display_cutoff",
+    "pooled_display_cutoff", "single_run_min_n", "pooled_min_n", "plot_seed",
+    "validation_inputs", "validation_groups", "validation_radius_step", "validation_radius_unit",
+    "validation_radius_scale", "comparison_inputs", "comparison_radius_step", "comparison_radius_unit",
+    "comparison_radius_scale", "comparison_reference", "comparison_ribbon", "ic50_files",
+    "max_IC50", "max_iterations", "sholl_parent_dir"))
+  saveRDS(settings, output_path("", "analysis_settings.rds"))
+}
+```
+
